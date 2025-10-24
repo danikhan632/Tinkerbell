@@ -4,6 +4,13 @@ Simple Example: 3 Users Training Different LoRA Adapters Concurrently
 
 This is a minimal example showing concurrent multi-user training.
 Each user gets their own LoRA adapter and trains it independently.
+
+Backend Configuration:
+- Training: Uses HuggingFace backend (concurrent) or Megatron (sequential)
+- Sampling: Uses vLLM for high-performance inference with LoRA adapters
+  - Enable vLLM: export USE_VLLM=true
+  - Start vLLM server: trl vllm-serve --model MODEL --enable-lora
+  - Falls back to HuggingFace if vLLM is not available
 """
 
 import threading
@@ -54,12 +61,14 @@ def train_user_adapter(user_name: str, client: TinkerClient):
             client.wait_for_result(request_id, timeout=30)
             print(f"[{user_name}]   Step {step}: Optimizer applied")
 
-        # Step 3: Test inference
-        print(f"[{user_name}] Testing inference...")
+        # Step 3: Test inference (uses vLLM if enabled)
+        print(f"[{user_name}] Testing inference with LoRA adapter...")
+        # NOTE: If USE_VLLM=true, this will use vLLM for fast sampling with the LoRA adapter
+        # The model_id is used to select the appropriate LoRA adapter in vLLM
         result = client.sample(
-            model_id=model_id,
+            model_id=model_id,  # LoRA adapter ID
             prompts=[f"Hello {user_name}!"],
-            sampling_params={"max_tokens": 20}
+            sampling_params={"max_tokens": 20, "temperature": 0.7}
         )
         generated = result.get("generated_text", "")
         print(f"[{user_name}] Generated: {generated}")
@@ -79,6 +88,14 @@ def main():
     print("\nThis example shows 3 users training their own LoRA adapters")
     print("simultaneously without blocking each other.\n")
 
+    print("Backend Configuration:")
+    print("  Training: HuggingFace (concurrent) or Megatron (sequential)")
+    print("  Sampling: vLLM (if USE_VLLM=true) or HuggingFace (fallback)")
+    print("\nTo use vLLM for fast sampling:")
+    print("  1. Start vLLM server: trl vllm-serve --model MODEL --enable-lora")
+    print("  2. Set environment: export USE_VLLM=true")
+    print("  3. Run this example\n")
+
     # Create client
     client = TinkerClient("http://localhost:8000")
 
@@ -89,7 +106,7 @@ def main():
     except Exception as e:
         print(f"✗ Cannot connect to server: {e}")
         print("\nPlease start the server first:")
-        print("  python app.py")
+        print("  python src/app.py")
         return
 
     print("Starting 3 concurrent users...\n")

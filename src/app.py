@@ -19,8 +19,14 @@ except ImportError:
 from worker import enqueue_job
 import threading
 
+# Import vLLM process manager
+import vllm_process_manager
+
 # Flask application setup (no Celery - using worker thread instead)
 app = Flask(__name__)
+
+# vLLM process manager (will be initialized if VLLM_AUTO_START=true)
+vllm_manager = None
 
 # In-memory stores (for prototyping)
 futures_store: dict[str, dict] = {}
@@ -34,6 +40,20 @@ import worker
 worker.futures_store = futures_store
 worker._futures_store_lock = futures_store_lock
 
+# Security middleware to reject proxy attempts
+@app.before_request
+def reject_proxy_requests():
+    """Reject requests that try to use this server as a proxy."""
+    # Check for absolute URLs (proxy attempts)
+    if request.url_rule is None:  # No route matched
+        path = request.path
+        # Reject CONNECT method (used for proxying)
+        if request.method == "CONNECT":
+            return jsonify({"detail": "Proxy requests not allowed"}), 403
+        # Reject if path contains external URLs
+        if "://" in path or path.startswith("http"):
+            return jsonify({"detail": "External URL requests not allowed"}), 403
+
 # Supported models (example)
 SUPPORTED_MODELS = [
     {"model_id": "llama-3-8b", "model_name": "meta-llama/Meta-Llama-3-8B", "arch": "llama"},
@@ -42,10 +62,46 @@ SUPPORTED_MODELS = [
 def generate_future_id() -> str:
     return f"future_{uuid.uuid4().hex[:8]}"
 
+@app.errorhandler(404)
+def handle_404(error):
+    try:
+        path = request.path if request else "unknown"
+        method = request.method if request else "unknown"
+        app.logger.warning(f"404 Not Found: {method} {path}")
+    except:
+        app.logger.warning("404 Not Found: Could not get request details")
+    return jsonify({"detail": "Not Found"}), 404
+
 @app.errorhandler(Exception)
 def handle_exception(error):
-    app.logger.error(traceback.format_exc())
+    try:
+        path = request.path if request else "unknown"
+        method = request.method if request else "unknown"
+        app.logger.error(f"Error on {method} {path}: {str(error)}")
+        app.logger.error(traceback.format_exc())
+    except:
+        app.logger.error(f"Error: {str(error)}")
+        app.logger.error(traceback.format_exc())
     return jsonify({"detail": str(error)}), 500
+
+@app.route("/")
+def index():
+    """Root endpoint showing API info."""
+    return jsonify({
+        "name": "Tinker API Server",
+        "version": "1.0",
+        "endpoints": {
+            "health": "/healthz",
+            "capabilities": "/get_server_capabilities",
+            "sample": "/api/v1/sample",
+            "async_sample": "/api/v1/asample"
+        }
+    })
+
+@app.route("/favicon.ico")
+def favicon():
+    # Return 204 No Content for favicon requests
+    return "", 204
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
@@ -229,5 +285,22 @@ def test_fwdbwd():
         return jsonify({"error": "Test timed out or failed"}), 500
 
 if __name__ == "__main__":
+    # Initialize vLLM process manager if auto-start is enabled
+    vllm_manager = vllm_process_manager.initialize()
+
+    if vllm_manager and vllm_manager.is_running():
+        print(f"\nvLLM server running at: {vllm_manager.base_url}")
+        print(f"vLLM status: {vllm_manager.get_status()}\n")
+
+        # Update environment for worker to connect to vLLM
+        if not os.environ.get("VLLM_BASE_URL"):
+            os.environ["VLLM_BASE_URL"] = vllm_manager.base_url
+        if not os.environ.get("USE_VLLM"):
+            os.environ["USE_VLLM"] = "true"
+
+    # Start worker thread (only in main process)
+    worker.start_worker()
+
     port = int(os.environ.get("PORT", 8000))
+    print(f"Starting Flask server on port {port}...\n")
     app.run(host="0.0.0.0", port=port)

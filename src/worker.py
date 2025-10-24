@@ -4,6 +4,7 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
 import time
+import multiprocessing
 
 import torch
 from torch.optim import Adam
@@ -11,6 +12,7 @@ from torch.utils.data import DataLoader
 
 # Try importing Megatron - it's optional
 try:
+    MEGATRON_AVAILABLE = True
     from megatron.core import parallel_state
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -24,10 +26,11 @@ try:
     from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
     from megatron.training.tokenizer.tokenizer import _NullTokenizer
     from megatron.core.distributed import DistributedDataParallel
-    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+    from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
     from megatron.training import get_tokenizer
-    MEGATRON_AVAILABLE = True
+    
 except ImportError:
     MEGATRON_AVAILABLE = False
     print("Megatron-LM not available. Using HuggingFace backend only.")
@@ -53,11 +56,27 @@ from storage import (
 # Import HuggingFace backend
 import hf_backend
 
+# Import Megatron backend
+if MEGATRON_AVAILABLE:
+    import megatron_backend
+else:
+    megatron_backend = None
+
+# Import vLLM backend
+try:
+    import vllm_backend
+    VLLM_BACKEND_AVAILABLE = vllm_backend.is_vllm_available()
+except ImportError:
+    print("vLLM backend not available. Install with: pip install vllm requests")
+    vllm_backend = None
+    VLLM_BACKEND_AVAILABLE = False
+
 
 _work_queue: queue.Queue[tuple[str, str, dict]] = queue.Queue()
 
 # Backend selection
 USE_MEGATRON = MEGATRON_AVAILABLE and os.environ.get("USE_MEGATRON", "false").lower() == "true"
+USE_VLLM = VLLM_BACKEND_AVAILABLE and os.environ.get("USE_VLLM", "false").lower() == "true"
 
 # Thread pool for concurrent job processing
 # Each worker can process different adapters concurrently
@@ -67,9 +86,69 @@ _futures_store_lock = threading.RLock()  # Lock for futures_store updates
 
 def get_backend() -> str:
     """Get the current backend being used."""
-    return "megatron" if USE_MEGATRON else "huggingface"
+    if USE_MEGATRON:
+        return "megatron"
+    elif USE_VLLM:
+        return "vllm"
+    else:
+        return "huggingface"
+
+def _call_vllm(request_json: dict) -> dict:
+    """Call vLLM backend for sampling with LoRA adapter support."""
+    params = request_json.get("sampling_params", {})
+    chunks = request_json.get("prompt", {}).get("chunks", [])
+
+    # Extract prompts from chunks or direct prompts field
+    try:
+        from megatron.training import get_tokenizer
+        tokenizer = get_tokenizer()
+        prompts = [tokenizer.detokenize(chunks[0]["tokens"])] if chunks else []
+    except:
+        prompts = request_json.get("prompts", [])
+
+    if not prompts:
+        prompts = [""]  # Default empty prompt
+
+    # Get LoRA adapter if specified
+    lora_adapter_id = request_json.get("model_id") or request_json.get("adapter_id")
+
+    # Call vLLM with parameters
+    vllm_result = vllm_backend.generate_with_vllm(
+        prompts=prompts,
+        lora_adapter_id=lora_adapter_id,
+        n=params.get("n", 1),
+        max_tokens=params.get("max_tokens", 16),
+        temperature=params.get("temperature", 1.0),
+        top_p=params.get("top_p", 1.0),
+        top_k=params.get("top_k", -1),
+        min_p=params.get("min_p", 0.0),
+        repetition_penalty=params.get("repetition_penalty", 1.0)
+    )
+
+    # Convert vLLM response to expected format
+    prompt_ids = vllm_result.get("prompt_ids", [])
+    completion_ids = vllm_result.get("completion_ids", [])
+    logprobs = vllm_result.get("logprobs", [])
+
+    # Build sequences in expected format
+    sequences = []
+    for i, comp_ids in enumerate(completion_ids):
+        comp_logprobs = logprobs[i] if i < len(logprobs) else None
+        max_expected = params.get("max_tokens", 16)
+        stop_reason = "length" if len(comp_ids) >= max_expected else "stop"
+        sequences.append({
+            "stop_reason": stop_reason,
+            "tokens": comp_ids,
+            "logprobs": comp_logprobs
+        })
+
+    return {
+        "sequences": sequences,
+        "prompt_logprobs": vllm_result.get("prompt_logprobs")
+    }
 
 def _call_megatron(request_json: dict) -> dict:
+    """Call Megatron server for sampling."""
     server_url = os.environ.get("MEGATRON_SERVER_URL", "http://localhost:5000")
     params = request_json.get("sampling_params", {})
     chunks = request_json.get("prompt", {}).get("chunks", [])
@@ -252,12 +331,18 @@ def _process_job(job_type: str, request_id: str, params_json: dict) -> None:
 
         # Dispatch by job type and backend
         if job_type in ("sample", "asample"):
-            if USE_MEGATRON:
+            if USE_VLLM:
+                # Use vLLM for high-performance sampling with LoRA support
+                result = _call_vllm(params_json)
+                if types and hasattr(types, 'SampleResponse'):
+                    result = types.SampleResponse.model_validate(result)
+            elif USE_MEGATRON:
+                # Use Megatron server for sampling
                 result = _call_megatron(params_json)
                 if types and hasattr(types, 'SampleResponse'):
                     result = types.SampleResponse.model_validate(result)
             else:
-                # HuggingFace generate - use simple dict access
+                # Fallback to HuggingFace for sampling
                 model_id = params_json.get("model_id", "base")
                 base_model = params_json.get("base_model", "base")
 
@@ -328,7 +413,16 @@ def _process_job(job_type: str, request_id: str, params_json: dict) -> None:
                 r=params_json.get('rank', 16),
                 lora_alpha=params_json.get('alpha', 32)
             )
-            hf_backend.create_lora_adapter(model_id, lora_config)
+            adapter = hf_backend.create_lora_adapter(model_id, lora_config)
+
+            # Automatically save and register with vLLM for co-located sampling
+            if USE_VLLM and VLLM_BACKEND_AVAILABLE:
+                try:
+                    adapter_path = vllm_backend.save_and_register_lora(model_id, adapter)
+                    print(f"LoRA adapter '{model_id}' ready for vLLM sampling at {adapter_path}")
+                except Exception as e:
+                    print(f"Warning: Could not register LoRA with vLLM: {e}")
+
             result = {"model_id": model_id}
         elif job_type == "remove_lora":
             # Make sure futures_store entry exists
@@ -337,6 +431,12 @@ def _process_job(job_type: str, request_id: str, params_json: dict) -> None:
                     futures_store[request_id] = {"request": params_json, "status": "pending"}
 
             adapter_id = params_json.get("model_id") or params_json.get("adapter_id")
+
+            # Unregister from vLLM first
+            if USE_VLLM and VLLM_BACKEND_AVAILABLE:
+                vllm_backend.unregister_lora_adapter(adapter_id)
+
+            # Delete from HuggingFace backend
             hf_backend.delete_adapter(adapter_id)
             result = {"status": "deleted"}
         elif job_type == "load_weights":
@@ -373,22 +473,63 @@ def _worker_loop() -> None:
     """
     global _thread_pool
 
-    # Initialize backend based on USE_MEGATRON flag
+    # Initialize backend based on flags
     if USE_MEGATRON:
         print("Initializing Megatron backend...")
-        print("WARNING: Megatron backend does not yet support concurrent processing")
-        # For Megatron, we still use sequential processing
-        # Future work: support multiple Megatron model instances
+        # Initialize Megatron model
         model, optimizer, data_iterator = _initialize_megatron()
+
+        # Initialize Megatron backend with PEFT support
+        if megatron_backend:
+            # Get the transformer config from the model
+            config = model.config
+            megatron_backend.initialize_base_model(model, config, optimizer)
+            print("Megatron backend initialized with LoRA support (PEFT)")
+            print("  Concurrent adapter creation: Enabled")
+            print("  Training mode: Sequential (PEFT limitation)")
     else:
-        print("Initializing HuggingFace backend...")
-        print(f"Worker pool size: {MAX_WORKERS} threads")
-        hf_backend.initialize_base_model()
+        model, optimizer, data_iterator = None, None, None
+        # Initialize HuggingFace backend if not using Megatron and not using vLLM-only
+        if not USE_VLLM:
+            print("Initializing HuggingFace backend...")
+            print(f"Worker pool size: {MAX_WORKERS} threads")
+            hf_backend.initialize_base_model()
+        else:
+            print("Using vLLM-only mode (no HuggingFace backend)")
+            print("WARNING: Training operations will not work in vLLM-only mode")
+
+    # Initialize vLLM engine after training backend
+    if USE_VLLM:
+        print("\nInitializing vLLM engine (in-process, co-located)...")
+
+        # If HuggingFace is also loaded, warn about memory usage
+        if not USE_MEGATRON and hf_backend.base_model is not None:
+            print("WARNING: Both HuggingFace and vLLM are loading models!")
+            print("This may cause OOM. Consider one of:")
+            print("  1. Use vLLM only: export USE_VLLM=true (no training)")
+            print("  2. Use HuggingFace only: export USE_VLLM=false")
+            print("  3. Use Megatron + vLLM: export USE_MEGATRON=true USE_VLLM=true")
+
+        vllm_backend.initialize_vllm_engine()
+        print("vLLM engine initialized for high-performance sampling with LoRA support")
+        print("  Mode: Co-located (same process, same GPU memory, immediate LoRA access)")
 
     # Create thread pool for concurrent job processing
     _thread_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="worker")
 
-    print(f"Worker pool initialized. Concurrent job processing: {'Disabled (Megatron)' if USE_MEGATRON else 'Enabled (HF)'}")
+    backend_info = []
+    if USE_VLLM:
+        backend_info.append("vLLM (sampling)")
+    if USE_MEGATRON:
+        backend_info.append("Megatron (training)")
+    if not USE_MEGATRON:
+        backend_info.append("HuggingFace (training/sampling)")
+
+    print(f"Worker pool initialized. Active backends: {', '.join(backend_info)}")
+    if USE_MEGATRON:
+        print(f"Concurrent job processing: Sequential training (PEFT multi-adapter)")
+    else:
+        print(f"Concurrent job processing: Enabled (HuggingFace)")
 
     while True:
         job_type, request_id, params_json = _work_queue.get()
@@ -406,28 +547,97 @@ def _process_megatron_job(job_type: str, request_id: str, params_json: dict, mod
     try:
         # Dispatch by job type
         if job_type in ("sample", "asample"):
-            result = _call_megatron(params_json)
+            if USE_VLLM:
+                # Use vLLM for sampling instead of Megatron server
+                result = _call_vllm(params_json)
+            else:
+                # Use Megatron server
+                result = _call_megatron(params_json)
             if types and hasattr(types, 'SampleResponse'):
                 result = types.SampleResponse.model_validate(result)
         elif job_type == "forward":
             result = _call_megatron_training("forward", params_json, model, optimizer, data_iterator)
         elif job_type == "fwdbwd":
-            result = _call_megatron_training("fwdbwd", params_json, model, optimizer, data_iterator)
+            # Use megatron_backend for LoRA training
+            model_id = params_json.get("model_id") or params_json.get("adapter_id", "default")
+            data = params_json.get("data", [])
+            loss_fn = params_json.get("loss_fn", "cross_entropy")
+            loss_fn_inputs = params_json.get("loss_fn_inputs", {})
+
+            # Create LoRA config from params
+            lora_config = None
+            if "rank" in params_json or "alpha" in params_json:
+                lora_config = megatron_backend.LoraConfigParams(
+                    r=params_json.get("rank", 16),
+                    lora_alpha=params_json.get("alpha", 32),
+                    lora_dropout=params_json.get("lora_dropout", 0.1),
+                )
+
+            result = megatron_backend.forward_backward(
+                model_id=model_id,
+                data=data,
+                loss_fn=loss_fn,
+                loss_fn_inputs=loss_fn_inputs,
+                lora_config=lora_config
+            )
         elif job_type == "optim":
-            result = _call_megatron_training("optim_step", params_json, model, optimizer, data_iterator)
+            # Use megatron_backend for optimizer step
+            model_id = params_json.get("model_id") or params_json.get("adapter_id", "default")
+            adam_params = None
+            if "learning_rate" in params_json:
+                adam_params = megatron_backend.AdamParams(
+                    learning_rate=params_json.get("learning_rate", 1e-4),
+                    beta1=params_json.get("beta1", 0.9),
+                    beta2=params_json.get("beta2", 0.999),
+                    eps=params_json.get("eps", 1e-8),
+                    weight_decay=params_json.get("weight_decay", 0.0),
+                )
+
+            result = megatron_backend.optim_step(model_id, adam_params)
         elif job_type == "add_lora":
-            # Persist LoRA metadata and placeholder weights storage
+            # Create LoRA adapter using megatron_backend
             base_model = params_json.get('base_model', 'base')
             adapter_id = f"{base_model}_lora_{os.urandom(4).hex()}"
+
+            # Create LoRA config from params
+            lora_config = megatron_backend.LoraConfigParams(
+                r=params_json.get("rank", 16),
+                lora_alpha=params_json.get("alpha", 32),
+                lora_dropout=params_json.get("lora_dropout", 0.1),
+                target_modules=params_json.get("target_modules"),
+            )
+
+            # Create adapter
+            megatron_backend.create_lora_adapter(adapter_id, lora_config)
+
+            # Persist metadata
             meta = {key: params_json.get(key) for key in ('rank','alpha') if key in params_json}
             meta['created_at'] = datetime.now().isoformat()
             save_lora_metadata(adapter_id, meta)
-            upload_lora_weights(adapter_id, b"")
+
+            # Save adapter weights for vLLM if enabled
+            if USE_VLLM and vllm_backend:
+                try:
+                    # Get the PEFT model from megatron_backend
+                    peft_model = megatron_backend.lora_adapters.get(adapter_id)
+                    if peft_model:
+                        adapter_path = vllm_backend.save_and_register_lora(adapter_id, peft_model)
+                        print(f"LoRA adapter '{adapter_id}' ready for vLLM sampling at {adapter_path}")
+                except Exception as e:
+                    print(f"Warning: Could not register LoRA with vLLM: {e}")
+
             result = {"model_id": adapter_id}
         elif job_type == "remove_lora":
+            # Remove adapter using megatron_backend
             adapter_id = params_json.get("model_id") or params_json.get("adapter_id")
+            megatron_backend.remove_lora_adapter(adapter_id)
             delete_lora_metadata(adapter_id)
             delete_lora_weights(adapter_id)
+
+            # Unregister from vLLM if enabled
+            if USE_VLLM and vllm_backend:
+                vllm_backend.unregister_lora_adapter(adapter_id)
+
             result = {"status": "deleted"}
         elif job_type == "load_weights":
             result = {"status": "loaded"}
@@ -450,9 +660,28 @@ def _process_megatron_job(job_type: str, request_id: str, params_json: dict, mod
         futures_store[request_id]["status"] = "error"
         futures_store[request_id]["result"] = str(exc)
 
-# Start worker thread
-_worker_thread = threading.Thread(target=_worker_loop, daemon=True)
-_worker_thread.start()
+# Worker thread - will be started by start_worker()
+_worker_thread = None
+_worker_started = False
+
+def start_worker():
+    """Start the worker thread. Call this from main process only."""
+    global _worker_thread, _worker_started
+
+    # Don't start worker in spawned child processes
+    if multiprocessing.current_process().name != 'MainProcess':
+        print(f"Skipping worker start in child process: {multiprocessing.current_process().name}")
+        return
+
+    if _worker_started:
+        print("Worker already started")
+        return
+
+    if _worker_thread is None or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
+        _worker_thread.start()
+        _worker_started = True
+        print("Worker thread started")
 
 def enqueue_job(job_type: str, request_id: str, params_json: dict) -> None:
     _work_queue.put((job_type, request_id, params_json))
