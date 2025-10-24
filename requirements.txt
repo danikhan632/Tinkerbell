@@ -1,0 +1,23 @@
+# Flask Server Core Dependencies
+flask>=2.3.0
+werkzeug>=2.3.0
+
+# HuggingFace Backend
+torch>=2.0.0
+transformers>=4.30.0
+peft>=0.4.0
+accelerate>=0.20.0
+
+# HTTP Requests
+httpx>=0.24.0
+requests>=2.31.0
+
+# Optional: Tinker SDK (for type validation)
+# tinker-sdk
+
+# Optional: Storage (only needed for Megatron backend)
+# redis>=4.5.0
+# minio>=7.1.0
+
+# Optional: Megatron-LM (only if using Megatron backend)
+# megatron-lm
