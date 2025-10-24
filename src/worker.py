@@ -194,10 +194,25 @@ def _initialize_megatron(tensor_model_parallel_size: int = 1, pipeline_model_par
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    rank: int = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size: int = torch.cuda.device_count()
+    rank: int = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    world_size: int = int(os.environ.get("WORLD_SIZE", str(torch.cuda.device_count())))
+
+    # For single-machine setup, set environment variables if not already set
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = "29500"
+
     torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(world_size=world_size, rank=rank)
+
+    # Initialize process group with proper backend and init method
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="nccl",  # Use NCCL for NVIDIA GPUs
+            init_method="env://",  # Use environment variables
+            world_size=world_size,
+            rank=rank
+        )
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(

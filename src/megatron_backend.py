@@ -4,6 +4,7 @@ Megatron + PEFT backend for distributed LoRA fine-tuning.
 This module provides distributed training using:
 - Megatron-LM for distributed model parallelism
 - PEFT for LoRA adapters (with Megatron support)
+- Per-user/adapter optimizers with independent learning rates
 - Custom loss functions (cross_entropy, importance_sampling, ppo)
 - Concurrent adapter support with sequential training
 """
@@ -52,9 +53,8 @@ import loss_functions
 base_model = None  # Optional[GPTModel]
 megatron_config = None  # Optional[TransformerConfig]
 tokenizer = None  # Megatron tokenizer
-optimizer: Optional[torch.optim.Optimizer] = None
 lora_adapters: Dict[str, PeftModel] = {}  # Maps adapter_id -> PeftModel reference
-optimizers: Dict[str, torch.optim.Optimizer] = {}
+optimizers: Dict[str, torch.optim.Optimizer] = {}  # Per-user/adapter optimizers
 gradients_accumulated: Dict[str, bool] = {}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -132,7 +132,6 @@ class ChatDataset(Dataset):
 def initialize_base_model(
     model: GPTModel,
     config: TransformerConfig,
-    base_optimizer: Optional[torch.optim.Optimizer] = None
 ) -> None:
     """
     Initialize the base Megatron model and tokenizer (thread-safe).
@@ -140,9 +139,8 @@ def initialize_base_model(
     Args:
         model: Megatron GPTModel instance
         config: Megatron TransformerConfig
-        base_optimizer: Optional base optimizer
     """
-    global base_model, megatron_config, tokenizer, optimizer
+    global base_model, megatron_config, tokenizer
 
     with _base_model_lock:
         if base_model is not None:
@@ -151,7 +149,6 @@ def initialize_base_model(
 
         base_model = model
         megatron_config = config
-        optimizer = base_optimizer
 
         # Get Megatron tokenizer
         if get_megatron_tokenizer is not None:
@@ -221,6 +218,51 @@ def create_lora_adapter(model_id: str, lora_config: Optional[LoraConfigParams] =
 
         print(f"Created LoRA adapter '{model_id}'")
         return peft_model
+
+
+def _create_or_update_optimizer(model_id: str, adam_params: AdamParams) -> torch.optim.Optimizer:
+    """
+    Create or update optimizer for a specific adapter (internal helper).
+
+    Each user/adapter gets their own optimizer instance to allow independent
+    learning rates and optimization states.
+
+    Args:
+        model_id: ID of the LoRA adapter
+        adam_params: Adam optimizer parameters
+
+    Returns:
+        Optimizer instance for this adapter
+    """
+    global peft_model
+
+    if model_id not in optimizers:
+        # Create new optimizer for this adapter
+        # Get only the parameters for this specific adapter
+        adapter_params = [p for n, p in peft_model.named_parameters() if model_id in n and p.requires_grad]
+
+        if not adapter_params:
+            raise ValueError(f"No trainable parameters found for adapter '{model_id}'")
+
+        optimizers[model_id] = torch.optim.Adam(
+            adapter_params,
+            lr=adam_params.learning_rate,
+            betas=(adam_params.beta1, adam_params.beta2),
+            eps=adam_params.eps,
+            weight_decay=adam_params.weight_decay
+        )
+        print(f"[{model_id}] Created new optimizer with LR={adam_params.learning_rate}")
+    else:
+        # Update existing optimizer hyperparameters
+        opt = optimizers[model_id]
+        for param_group in opt.param_groups:
+            param_group['lr'] = adam_params.learning_rate
+            param_group['betas'] = (adam_params.beta1, adam_params.beta2)
+            param_group['eps'] = adam_params.eps
+            param_group['weight_decay'] = adam_params.weight_decay
+        print(f"[{model_id}] Updated optimizer with LR={adam_params.learning_rate}")
+
+    return optimizers[model_id]
 
 
 def forward_backward(
@@ -361,10 +403,13 @@ def optim_step(model_id: str, adam_params: Optional[AdamParams] = None) -> Dict[
     """
     Apply optimizer step to a specific adapter.
 
+    Each adapter has its own optimizer with independent learning rate
+    and optimization state, enabling per-user customization.
+
     Uses global training lock to ensure sequential processing.
 
     Args:
-        model_id: ID of the LoRA adapter
+        model_id: ID of the LoRA adapter (user identifier)
         adam_params: Adam optimizer parameters
 
     Returns:
@@ -386,29 +431,10 @@ def optim_step(model_id: str, adam_params: Optional[AdamParams] = None) -> Dict[
         if adam_params is None:
             adam_params = AdamParams()
 
-        # Create or update optimizer for this adapter
-        if model_id not in optimizers:
-            # Get only the parameters for this adapter
-            adapter_params = [p for n, p in peft_model.named_parameters() if model_id in n and p.requires_grad]
-
-            optimizers[model_id] = torch.optim.Adam(
-                adapter_params,
-                lr=adam_params.learning_rate,
-                betas=(adam_params.beta1, adam_params.beta2),
-                eps=adam_params.eps,
-                weight_decay=adam_params.weight_decay
-            )
-        else:
-            # Update optimizer hyperparameters
-            opt = optimizers[model_id]
-            for param_group in opt.param_groups:
-                param_group['lr'] = adam_params.learning_rate
-                param_group['betas'] = (adam_params.beta1, adam_params.beta2)
-                param_group['eps'] = adam_params.eps
-                param_group['weight_decay'] = adam_params.weight_decay
+        # Create or update optimizer for this specific user/adapter
+        opt = _create_or_update_optimizer(model_id, adam_params)
 
         # Perform optimizer step
-        opt = optimizers[model_id]
         opt.step()
         opt.zero_grad()
 
@@ -426,9 +452,56 @@ def optim_step(model_id: str, adam_params: Optional[AdamParams] = None) -> Dict[
         }
 
 
+def get_optimizer_state(model_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get the current optimizer state for a specific user/adapter.
+
+    Args:
+        model_id: Adapter ID
+
+    Returns:
+        Dict with optimizer state information or None if not found
+    """
+    with _adapters_lock:
+        if model_id not in optimizers:
+            return None
+
+        opt = optimizers[model_id]
+        if not opt.param_groups:
+            return None
+
+        # Return state from first param group (all groups have same hyperparams)
+        param_group = opt.param_groups[0]
+        return {
+            "model_id": model_id,
+            "learning_rate": param_group['lr'],
+            "beta1": param_group['betas'][0],
+            "beta2": param_group['betas'][1],
+            "eps": param_group['eps'],
+            "weight_decay": param_group['weight_decay'],
+            "num_params": sum(p.numel() for p in param_group['params']),
+        }
+
+
+def list_optimizer_states() -> List[Dict[str, Any]]:
+    """
+    List optimizer states for all users/adapters.
+
+    Returns:
+        List of optimizer state dicts
+    """
+    with _adapters_lock:
+        states = []
+        for model_id in optimizers.keys():
+            state = get_optimizer_state(model_id)
+            if state:
+                states.append(state)
+        return states
+
+
 def remove_lora_adapter(model_id: str) -> bool:
     """
-    Remove a LoRA adapter.
+    Remove a LoRA adapter and its associated optimizer.
 
     Args:
         model_id: Adapter ID to remove
@@ -443,6 +516,7 @@ def remove_lora_adapter(model_id: str) -> bool:
             del lora_adapters[model_id]
             if model_id in optimizers:
                 del optimizers[model_id]
+                print(f"Removed optimizer for '{model_id}'")
             if model_id in gradients_accumulated:
                 del gradients_accumulated[model_id]
 
