@@ -153,15 +153,22 @@ def compute_rewards(samples: List[Dict[str, Any]]) -> List[float]:
     return rewards
 
 
-def async_rl_training(model_id: str, samples: List[Dict[str, Any]], rewards: List[float]):
+def async_rl_training(model_id: str, samples: List[Dict[str, Any]], rewards: List[float], kl_coeff: float = 0.1):
     """
-    Train the model using async forward-backward with rewards.
+    Train the model using async forward-backward with rewards and KL divergence penalty.
 
-    This uses a simple importance sampling / REINFORCE-style loss:
+    This uses importance sampling / REINFORCE-style loss with KL divergence constraint:
     - Higher rewards → lower loss (reinforce good behaviors)
+    - KL penalty prevents policy from deviating too much from base model
     - Training data is the generated completions
+
+    Args:
+        model_id: LoRA adapter ID
+        samples: List of samples with prompt and completion
+        rewards: List of rewards for each sample
+        kl_coeff: KL divergence penalty coefficient (default: 0.1)
     """
-    print(f"\n🔧 Async RL training on {len(samples)} samples...")
+    print(f"\n🔧 Async RL training on {len(samples)} samples (KL coeff: {kl_coeff})...")
     print("Submitting training jobs...")
 
     start_time = time.time()
@@ -174,14 +181,17 @@ def async_rl_training(model_id: str, samples: List[Dict[str, Any]], rewards: Lis
             {"role": "assistant", "content": sample["completion"]}
         ]
 
-        # Submit async forward-backward with reward-based loss
-        # The loss_fn_inputs passes the reward to the loss function
+        # Submit async forward-backward with reward-based loss + KL penalty
+        # The loss_fn_inputs passes the reward and KL parameters
         response = requests.post(f"{BASE_URL}/api/v1/forward_backward_async", json={
             "model_id": model_id,
             "data": [training_messages],
             "loss_fn": "importance_sampling",  # RL-style loss
             "loss_fn_inputs": {
                 "rewards": [reward],
+                "prompts": [sample["prompt"]],      # For KL computation
+                "completions": [sample["completion"]],  # For KL computation
+                "kl_coeff": kl_coeff,  # KL penalty coefficient
                 # In real RLHF, you'd also pass:
                 # "old_log_probs": [...],  # from policy before update
                 # "advantages": [...],     # GAE or similar
@@ -202,16 +212,22 @@ def async_rl_training(model_id: str, samples: List[Dict[str, Any]], rewards: Lis
     # Retrieve training results
     print("Training results:")
     total_loss = 0.0
+    total_kl = 0.0
     successful = 0
 
     for i, future_id, reward in training_futures:
         try:
             result = retrieve_future(future_id, timeout=30)
             loss = result.get("loss", 0.0)
+            base_loss = result.get("base_loss", loss)
+            kl_penalty = result.get("kl_penalty", 0.0)
+            kl_div = result.get("metrics", {}).get("kl_div", 0.0)
+
             total_loss += loss
+            total_kl += kl_div
             successful += 1
 
-            print(f"  Sample {i}: loss={loss:.4f}, reward={reward:.3f} ✓")
+            print(f"  Sample {i}: loss={loss:.4f} (base={base_loss:.4f}, kl_penalty={kl_penalty:.4f}), reward={reward:.3f}, kl={kl_div:.4f} ✓")
 
             # Apply optimizer step
             opt_response = requests.post(f"{BASE_URL}/api/v1/optim_step_async", json={
@@ -228,12 +244,14 @@ def async_rl_training(model_id: str, samples: List[Dict[str, Any]], rewards: Lis
 
     elapsed = time.time() - start_time
     avg_loss = total_loss / successful if successful > 0 else 0.0
+    avg_kl = total_kl / successful if successful > 0 else 0.0
 
     print(f"\n✓ RL training complete in {elapsed:.2f}s")
     print(f"  Average loss: {avg_loss:.4f}")
+    print(f"  Average KL div: {avg_kl:.4f}")
     print(f"  Success rate: {successful}/{len(training_futures)}")
 
-    return avg_loss, elapsed
+    return avg_loss, avg_kl, elapsed
 
 
 def main():
@@ -316,8 +334,9 @@ Pattern inspired by: Megatron-Bridge rlhf_with_bridge.py
         # Phase 2: Compute rewards
         rewards = compute_rewards(samples)
 
-        # Phase 3: Train with async API
-        avg_loss, train_time = async_rl_training(model_id, samples, rewards)
+        # Phase 3: Train with async API (with KL divergence constraint)
+        kl_coeff = 0.1  # KL penalty coefficient
+        avg_loss, avg_kl, train_time = async_rl_training(model_id, samples, rewards, kl_coeff=kl_coeff)
 
         # Track metrics
         all_rewards.extend(rewards)
@@ -330,6 +349,7 @@ Pattern inspired by: Megatron-Bridge rlhf_with_bridge.py
         print(f"\n📊 Iteration {iteration} Summary:")
         print(f"  Avg Reward: {avg_reward_this_iter:.3f}")
         print(f"  Avg Loss: {avg_loss:.4f}")
+        print(f"  Avg KL Div: {avg_kl:.4f}")
         print(f"  Time: {train_time:.2f}s")
 
     # Final average across all iterations
