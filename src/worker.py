@@ -105,8 +105,11 @@ def _call_vllm(request_json: dict) -> dict:
     except:
         prompts = request_json.get("prompts", [])
 
+    # Filter out empty prompts and validate
+    prompts = [p for p in prompts if p and p.strip()]
+
     if not prompts:
-        prompts = [""]  # Default empty prompt
+        raise ValueError("No valid prompts provided. Prompts cannot be empty.")
 
     # Get LoRA adapter if specified
     lora_adapter_id = request_json.get("model_id") or request_json.get("adapter_id")
@@ -127,6 +130,7 @@ def _call_vllm(request_json: dict) -> dict:
     # Convert vLLM response to expected format
     prompt_ids = vllm_result.get("prompt_ids", [])
     completion_ids = vllm_result.get("completion_ids", [])
+    completions_text = vllm_result.get("completions", [])
     logprobs = vllm_result.get("logprobs", [])
 
     # Build sequences in expected format
@@ -143,6 +147,7 @@ def _call_vllm(request_json: dict) -> dict:
 
     return {
         "sequences": sequences,
+        "completions": completions_text,  # Add text completions
         "prompt_logprobs": vllm_result.get("prompt_logprobs")
     }
 

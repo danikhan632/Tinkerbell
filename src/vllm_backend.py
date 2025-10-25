@@ -192,6 +192,7 @@ def generate_with_vllm(
     # Convert vLLM outputs to expected format
     prompt_ids = []
     completion_ids = []
+    completions_text = []
     logprobs = []
 
     for output in outputs:
@@ -199,6 +200,7 @@ def generate_with_vllm(
 
         for completion in output.outputs:
             completion_ids.append(completion.token_ids)
+            completions_text.append(completion.text)  # Add decoded text
 
             # Extract logprobs if available
             if completion.logprobs:
@@ -210,6 +212,7 @@ def generate_with_vllm(
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
+        "completions": completions_text,  # Add text completions
         "logprobs": logprobs,
         "prompt_logprobs": None  # vLLM doesn't return prompt logprobs by default
     }
