@@ -1,0 +1,303 @@
+======================================================================
+Tinkerbell: Async RL Training with vLLM Policy Sampling
+======================================================================
+
+This example demonstrates a simplified RL training loop:
+
+1. 🎲 ROLLOUT: Sample completions from model using vLLM (fast!)
+2. 💰 REWARD:  Compute rewards for each completion
+3. 🔧 TRAIN:   Update policy using async forward-backward with rewards
+4. 🔁 REPEAT:  Multiple training iterations
+
+Pattern inspired by: Megatron-Bridge rlhf_with_bridge.py
+
+✓ Server is healthy: {'status': 'ok'}
+
+Creating LoRA adapter...
+✓ Created adapter: base_lora_e80b8307
+
+======================================================================
+TRAINING CONFIGURATION
+======================================================================
+  RL Iterations: 5
+  Samples per iteration: 5
+  Total samples: 25
+  Prompts: 5
+======================================================================
+
+
+======================================================================
+ITERATION 1/5
+======================================================================
+
+🎲 Sampling completions with vLLM (model: base_lora_e80b8307)...
+  Sample 1: ✓ Generated 695 chars
+  Sample 2: ✓ Generated 282 chars
+  Sample 3: ✓ Generated 599 chars
+  Sample 4: ✓ Generated 500 chars
+  Sample 5: ✓ Generated 568 chars
+
+💰 Computing rewards for 5 samples...
+  Sample 1: reward=0.585 (length=695)
+  Sample 2: reward=0.525 (length=282)
+  Sample 3: reward=0.491 (length=599)
+  Sample 4: reward=0.508 (length=500)
+  Sample 5: reward=0.437 (length=568)
+
+🔧 Async RL training on 5 samples (KL coeff: 0.1)...
+Submitting training jobs...
+  ✓ Submitted sample 1 (reward=0.585)
+  ✓ Submitted sample 2 (reward=0.525)
+  ✓ Submitted sample 3 (reward=0.491)
+  ✓ Submitted sample 4 (reward=0.508)
+  ✓ Submitted sample 5 (reward=0.437)
+
+✓ All 5 training jobs submitted in 0.01s
+Processing in parallel...
+
+Training results:
+  Sample 1: loss=2549.1416 (base=2549.1416, kl_penalty=0.0000), reward=0.585, kl=0.0000 ✓
+  Sample 2: loss=1880.2870 (base=1880.2870, kl_penalty=0.0000), reward=0.525, kl=0.0000 ✓
+  Sample 3: loss=1700.4369 (base=1700.4369, kl_penalty=0.0000), reward=0.491, kl=0.0000 ✓
+  Sample 4: loss=1381.1644 (base=1381.1644, kl_penalty=0.0000), reward=0.508, kl=0.0000 ✓
+  Sample 5: loss=1612.5884 (base=1612.5884, kl_penalty=0.0000), reward=0.437, kl=0.0000 ✓
+
+✓ RL training complete in 5.76s
+  Average loss: 1824.7237
+  Average KL div: 0.0000
+  Success rate: 5/5
+
+📊 Iteration 1 Summary:
+  Avg Reward: 0.509
+  Avg Loss: 1824.7237
+  Avg KL Div: 0.0000
+  Time: 5.76s
+
+======================================================================
+ITERATION 2/5
+======================================================================
+
+🎲 Sampling completions with vLLM (model: base_lora_e80b8307)...
+  Sample 1: ✓ Generated 695 chars
+  Sample 2: ✓ Generated 282 chars
+  Sample 3: ✓ Generated 599 chars
+  Sample 4: ✓ Generated 500 chars
+  Sample 5: ✓ Generated 568 chars
+
+💰 Computing rewards for 5 samples...
+  Sample 1: reward=0.577 (length=695)
+  Sample 2: reward=0.556 (length=282)
+  Sample 3: reward=0.319 (length=599)
+  Sample 4: reward=0.685 (length=500)
+  Sample 5: reward=0.368 (length=568)
+
+🔧 Async RL training on 5 samples (KL coeff: 0.1)...
+Submitting training jobs...
+  ✓ Submitted sample 1 (reward=0.577)
+  ✓ Submitted sample 2 (reward=0.556)
+  ✓ Submitted sample 3 (reward=0.319)
+  ✓ Submitted sample 4 (reward=0.685)
+  ✓ Submitted sample 5 (reward=0.368)
+
+✓ All 5 training jobs submitted in 0.02s
+Processing in parallel...
+
+Training results:
+  Sample 1: loss=2070.9106 (base=2070.9106, kl_penalty=0.0000), reward=0.577, kl=0.0000 ✓
+  Sample 2: loss=1568.0437 (base=1568.0437, kl_penalty=0.0000), reward=0.556, kl=0.0000 ✓
+  Sample 3: loss=870.8827 (base=870.8827, kl_penalty=0.0000), reward=0.319, kl=0.0000 ✓
+  Sample 4: loss=1520.1637 (base=1520.1637, kl_penalty=0.0000), reward=0.685, kl=0.0000 ✓
+  Sample 5: loss=1066.9823 (base=1066.9823, kl_penalty=0.0000), reward=0.368, kl=0.0000 ✓
+
+✓ RL training complete in 1.58s
+  Average loss: 1419.3966
+  Average KL div: 0.0000
+  Success rate: 5/5
+
+📊 Iteration 2 Summary:
+  Avg Reward: 0.501
+  Avg Loss: 1419.3966
+  Avg KL Div: 0.0000
+  Time: 1.58s
+
+======================================================================
+ITERATION 3/5
+======================================================================
+
+🎲 Sampling completions with vLLM (model: base_lora_e80b8307)...
+  Sample 1: ✓ Generated 695 chars
+  Sample 2: ✓ Generated 282 chars
+  Sample 3: ✓ Generated 599 chars
+  Sample 4: ✓ Generated 500 chars
+  Sample 5: ✓ Generated 568 chars
+
+💰 Computing rewards for 5 samples...
+  Sample 1: reward=0.650 (length=695)
+  Sample 2: reward=0.601 (length=282)
+  Sample 3: reward=0.300 (length=599)
+  Sample 4: reward=0.587 (length=500)
+  Sample 5: reward=0.440 (length=568)
+
+🔧 Async RL training on 5 samples (KL coeff: 0.1)...
+Submitting training jobs...
+  ✓ Submitted sample 1 (reward=0.650)
+  ✓ Submitted sample 2 (reward=0.601)
+  ✓ Submitted sample 3 (reward=0.300)
+  ✓ Submitted sample 4 (reward=0.587)
+  ✓ Submitted sample 5 (reward=0.440)
+
+✓ All 5 training jobs submitted in 0.02s
+Processing in parallel...
+
+Training results:
+  Sample 1: loss=1836.6273 (base=1836.6273, kl_penalty=0.0000), reward=0.650, kl=0.0000 ✓
+  Sample 2: loss=1301.4757 (base=1301.4757, kl_penalty=0.0000), reward=0.601, kl=0.0000 ✓
+  Sample 3: loss=619.7842 (base=619.7842, kl_penalty=0.0000), reward=0.300, kl=0.0000 ✓
+  Sample 4: loss=999.9420 (base=999.9420, kl_penalty=0.0000), reward=0.587, kl=0.0000 ✓
+  Sample 5: loss=977.6712 (base=977.6712, kl_penalty=0.0000), reward=0.440, kl=0.0000 ✓
+
+✓ RL training complete in 1.58s
+  Average loss: 1147.1001
+  Average KL div: 0.0000
+  Success rate: 5/5
+
+📊 Iteration 3 Summary:
+  Avg Reward: 0.516
+  Avg Loss: 1147.1001
+  Avg KL Div: 0.0000
+  Time: 1.58s
+
+======================================================================
+ITERATION 4/5
+======================================================================
+
+🎲 Sampling completions with vLLM (model: base_lora_e80b8307)...
+  Sample 1: ✓ Generated 695 chars
+  Sample 2: ✓ Generated 282 chars
+  Sample 3: ✓ Generated 599 chars
+  Sample 4: ✓ Generated 500 chars
+  Sample 5: ✓ Generated 568 chars
+
+💰 Computing rewards for 5 samples...
+  Sample 1: reward=0.544 (length=695)
+  Sample 2: reward=0.612 (length=282)
+  Sample 3: reward=0.427 (length=599)
+  Sample 4: reward=0.675 (length=500)
+  Sample 5: reward=0.313 (length=568)
+
+🔧 Async RL training on 5 samples (KL coeff: 0.1)...
+Submitting training jobs...
+  ✓ Submitted sample 1 (reward=0.544)
+  ✓ Submitted sample 2 (reward=0.612)
+  ✓ Submitted sample 3 (reward=0.427)
+  ✓ Submitted sample 4 (reward=0.675)
+  ✓ Submitted sample 5 (reward=0.313)
+
+✓ All 5 training jobs submitted in 0.02s
+Processing in parallel...
+
+Training results:
+  Sample 1: loss=1100.3860 (base=1100.3860, kl_penalty=0.0000), reward=0.544, kl=0.0000 ✓
+  Sample 2: loss=950.8201 (base=950.8201, kl_penalty=0.0000), reward=0.612, kl=0.0000 ✓
+  Sample 3: loss=634.8282 (base=634.8282, kl_penalty=0.0000), reward=0.427, kl=0.0000 ✓
+  Sample 4: loss=849.8809 (base=849.8809, kl_penalty=0.0000), reward=0.675, kl=0.0000 ✓
+  Sample 5: loss=487.0111 (base=487.0111, kl_penalty=0.0000), reward=0.313, kl=0.0000 ✓
+
+✓ RL training complete in 1.57s
+  Average loss: 804.5853
+  Average KL div: 0.0000
+  Success rate: 5/5
+
+📊 Iteration 4 Summary:
+  Avg Reward: 0.514
+  Avg Loss: 804.5853
+  Avg KL Div: 0.0000
+  Time: 1.57s
+
+======================================================================
+ITERATION 5/5
+======================================================================
+
+🎲 Sampling completions with vLLM (model: base_lora_e80b8307)...
+  Sample 1: ✓ Generated 695 chars
+  Sample 2: ✓ Generated 282 chars
+  Sample 3: ✓ Generated 599 chars
+  Sample 4: ✓ Generated 500 chars
+  Sample 5: ✓ Generated 568 chars
+
+💰 Computing rewards for 5 samples...
+  Sample 1: reward=0.534 (length=695)
+  Sample 2: reward=0.617 (length=282)
+  Sample 3: reward=0.359 (length=599)
+  Sample 4: reward=0.570 (length=500)
+  Sample 5: reward=0.484 (length=568)
+
+🔧 Async RL training on 5 samples (KL coeff: 0.1)...
+Submitting training jobs...
+  ✓ Submitted sample 1 (reward=0.534)
+  ✓ Submitted sample 2 (reward=0.617)
+  ✓ Submitted sample 3 (reward=0.359)
+  ✓ Submitted sample 4 (reward=0.570)
+  ✓ Submitted sample 5 (reward=0.484)
+
+✓ All 5 training jobs submitted in 0.02s
+Processing in parallel...
+
+Training results:
+  Sample 1: loss=744.6816 (base=744.6816, kl_penalty=0.0000), reward=0.534, kl=0.0000 ✓
+  Sample 2: loss=637.0995 (base=637.0995, kl_penalty=0.0000), reward=0.617, kl=0.0000 ✓
+  Sample 3: loss=343.1037 (base=343.1037, kl_penalty=0.0000), reward=0.359, kl=0.0000 ✓
+  Sample 4: loss=478.2317 (base=478.2317, kl_penalty=0.0000), reward=0.570, kl=0.0000 ✓
+  Sample 5: loss=519.3758 (base=519.3758, kl_penalty=0.0000), reward=0.484, kl=0.0000 ✓
+
+✓ RL training complete in 1.57s
+  Average loss: 544.4985
+  Average KL div: 0.0000
+  Success rate: 5/5
+
+📊 Iteration 5 Summary:
+  Avg Reward: 0.513
+  Avg Loss: 544.4985
+  Avg KL Div: 0.0000
+  Time: 1.57s
+
+======================================================================
+FINAL SUMMARY
+======================================================================
+
+✓ RL Training Complete!
+
+Model: base_lora_e80b8307
+Total Iterations: 5
+Total Samples Trained: 25
+Total Training Time: 12.07s
+
+PERFORMANCE METRICS:
+  Overall Avg Reward: 0.511
+  Overall Avg Loss: 1148.0608
+  Throughput: 2.07 samples/sec
+  Time per iteration: 2.41s
+
+PATTERN DEMONSTRATED:
+1. vLLM Policy Sampling (fast inference with LoRA)
+2. Reward Computation (simple heuristic → replace with reward model)
+3. Async Training (parallel forward-backward with rewards)
+
+NEXT STEPS FOR PRODUCTION RLHF:
+- Use real reward model (sentiment, helpfulness, safety)
+- Implement PPO loss instead of simple importance sampling
+- Track old_log_probs for KL divergence constraint
+- Use Bridge.export_hf_weights() to sync training → inference
+- See: examples/rl/rlhf_with_bridge.py in Megatron-Bridge
+
+ADVANCED PATTERN (from rlhf_with_bridge.py):
+- HF model for generation (vLLM or transformers)
+- Reward model scores completions
+- Megatron-Bridge trains policy with custom loss
+- Bridge syncs weights back to HF model for next rollout
+
+======================================================================
+✓ Example complete!
+======================================================================
+
+shadeform@shadecloud:~/Tinkerbell/examples$ 

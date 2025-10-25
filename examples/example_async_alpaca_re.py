@@ -375,23 +375,6 @@ PERFORMANCE METRICS:
   Throughput: {total_samples/total_time:.2f} samples/sec
   Time per iteration: {total_time/num_iterations:.2f}s
 
-PATTERN DEMONSTRATED:
-1. vLLM Policy Sampling (fast inference with LoRA)
-2. Reward Computation (simple heuristic → replace with reward model)
-3. Async Training (parallel forward-backward with rewards)
-
-NEXT STEPS FOR PRODUCTION RLHF:
-- Use real reward model (sentiment, helpfulness, safety)
-- Implement PPO loss instead of simple importance sampling
-- Track old_log_probs for KL divergence constraint
-- Use Bridge.export_hf_weights() to sync training → inference
-- See: examples/rl/rlhf_with_bridge.py in Megatron-Bridge
-
-ADVANCED PATTERN (from rlhf_with_bridge.py):
-- HF model for generation (vLLM or transformers)
-- Reward model scores completions
-- Megatron-Bridge trains policy with custom loss
-- Bridge syncs weights back to HF model for next rollout
 """)
 
     print("="*70)
