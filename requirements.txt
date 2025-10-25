@@ -12,12 +12,15 @@ accelerate>=0.20.0
 httpx>=0.24.0
 requests>=2.31.0
 
+# Custom Loss Functions (for serialization)
+cloudpickle>=2.2.0
+
 # Optional: Tinker SDK (for type validation)
-# tinker-sdk
+
 
 # Optional: Storage (only needed for Megatron backend)
-# redis>=4.5.0
-# minio>=7.1.0
+redis>=4.5.0
+minio>=7.1.0
 
 # Optional: Megatron-LM (only if using Megatron backend)
-# megatron-lm
+

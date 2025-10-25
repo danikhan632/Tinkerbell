@@ -88,13 +88,53 @@ def handle_exception(error):
 def index():
     """Root endpoint showing API info."""
     return jsonify({
-        "name": "Tinker API Server",
-        "version": "1.0",
+        "name": "Tinkerbell API Server (Megatron-Bridge + vLLM)",
+        "version": "2.0",
+        "documentation": "https://tinker-docs.thinkingmachines.ai/async",
         "endpoints": {
             "health": "/healthz",
             "capabilities": "/get_server_capabilities",
-            "sample": "/api/v1/sample",
-            "async_sample": "/api/v1/asample"
+            "futures": "/retrieve_future",
+            "training": {
+                "sync": {
+                    "forward": "/api/v1/forward",
+                    "forward_backward": "/api/v1/forward_backward",
+                    "optim_step": "/api/v1/optim_step"
+                },
+                "async": {
+                    "forward": "/api/v1/forward_async",
+                    "forward_backward": "/api/v1/forward_backward_async",
+                    "optim_step": "/api/v1/optim_step_async"
+                }
+            },
+            "sampling": {
+                "sync": "/api/v1/sample",
+                "async": "/api/v1/asample"
+            },
+            "lora": {
+                "sync": {
+                    "add": "/api/v1/add_lora",
+                    "remove": "/api/v1/remove_lora"
+                },
+                "async": {
+                    "add": "/api/v1/add_lora_async",
+                    "remove": "/api/v1/remove_lora_async"
+                }
+            },
+            "weights": {
+                "async": {
+                    "load": "/api/v1/load_weights_async",
+                    "save": "/api/v1/save_weights_async",
+                    "save_for_sampler": "/api/v1/save_weights_for_sampler_async"
+                }
+            },
+            "legacy": {
+                "note": "Old endpoints (/fwd, /fwdbwd, etc.) still supported for backwards compatibility"
+            }
+        },
+        "pattern": {
+            "async": "Returns {request_id, model_id} immediately. Use /retrieve_future to get results.",
+            "sync": "Waits for completion and returns results directly."
         }
     })
 
@@ -153,29 +193,127 @@ def sample():
         result = futures_store[future_id].get("result")
     return jsonify(result if isinstance(result, dict) else {"result": str(result)})
 
-@app.route("/fwd", methods=["POST"])
-def fwd():
+# ============================================================================
+# ASYNC ENDPOINTS (Return futures immediately - Tinker standard pattern)
+# ============================================================================
+
+@app.route("/api/v1/forward_async", methods=["POST"])
+@app.route("/fwd", methods=["POST"])  # Legacy support
+def forward_async():
+    """Async forward pass - returns future immediately."""
     future_id = generate_future_id()
-    futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("forward", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/fwdbwd", methods=["POST"])
-def fwdbwd():
+@app.route("/api/v1/forward_backward_async", methods=["POST"])
+@app.route("/fwdbwd", methods=["POST"])  # Legacy support
+def forward_backward_async():
+    """Async forward-backward pass - returns future immediately."""
     future_id = generate_future_id()
-    futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("fwdbwd", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/optim_step", methods=["POST"])
-def optim_step():
+@app.route("/api/v1/optim_step_async", methods=["POST"])
+@app.route("/optim_step", methods=["POST"])  # Legacy support
+def optim_step_async():
+    """Async optimizer step - returns future immediately."""
     future_id = generate_future_id()
-    futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("optim", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
+
+# ============================================================================
+# SYNC ENDPOINTS (Wait for results before returning - Tinker standard pattern)
+# ============================================================================
+
+@app.route("/api/v1/forward", methods=["POST"])
+def forward():
+    """Sync forward pass - waits for result."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("forward", future_id, request.json)
+
+    # Wait for completion
+    import time
+    timeout = 60
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.5)
+        elapsed += 0.5
+
+    with futures_store_lock:
+        if futures_store[future_id]["status"] == "error":
+            error_msg = futures_store[future_id].get("result", "Unknown error")
+            abort(500, f"Forward failed: {error_msg}")
+        result = futures_store[future_id].get("result")
+    return jsonify(result if isinstance(result, dict) else {"result": str(result)})
+
+@app.route("/api/v1/forward_backward", methods=["POST"])
+def forward_backward():
+    """Sync forward-backward pass - waits for result."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("fwdbwd", future_id, request.json)
+
+    # Wait for completion
+    import time
+    timeout = 120  # Longer timeout for training
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.5)
+        elapsed += 0.5
+
+    with futures_store_lock:
+        if futures_store[future_id]["status"] == "error":
+            error_msg = futures_store[future_id].get("result", "Unknown error")
+            abort(500, f"Forward-backward failed: {error_msg}")
+        result = futures_store[future_id].get("result")
+    return jsonify(result if isinstance(result, dict) else {"result": str(result)})
+
+@app.route("/api/v1/optim_step", methods=["POST"])
+def optim_step():
+    """Sync optimizer step - waits for result."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("optim", future_id, request.json)
+
+    # Wait for completion
+    import time
+    timeout = 60
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.5)
+        elapsed += 0.5
+
+    with futures_store_lock:
+        if futures_store[future_id]["status"] == "error":
+            error_msg = futures_store[future_id].get("result", "Unknown error")
+            abort(500, f"Optimizer step failed: {error_msg}")
+        result = futures_store[future_id].get("result")
+    return jsonify(result if isinstance(result, dict) else {"result": str(result)})
 
 @app.route("/retrieve_future", methods=["POST"])
 def retrieve_future():
@@ -207,37 +345,121 @@ def retrieve_future():
 
         return jsonify(result.model_dump() if hasattr(result, "model_dump") else result)
 
-@app.route("/add_lora", methods=["POST"])
-def add_lora():
+# ============================================================================
+# LORA MANAGEMENT ENDPOINTS (Async by default)
+# ============================================================================
+
+@app.route("/api/v1/add_lora_async", methods=["POST"])
+@app.route("/add_lora", methods=["POST"])  # Legacy support
+def add_lora_async():
+    """Add LoRA adapter - async (returns future immediately)."""
     future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("add_lora", future_id, request.json)
     model_id = request.json.get("base_model", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/remove_lora", methods=["POST"])
-def remove_lora():
+@app.route("/api/v1/add_lora", methods=["POST"])
+def add_lora():
+    """Add LoRA adapter - sync (waits for result)."""
     future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("add_lora", future_id, request.json)
+
+    # Wait for completion
+    import time
+    timeout = 30
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.5)
+        elapsed += 0.5
+
+    with futures_store_lock:
+        final_status = futures_store[future_id]["status"]
+        if final_status == "error":
+            error_msg = futures_store[future_id].get("result", "Unknown error")
+            abort(500, f"Add LoRA failed: {error_msg}")
+        elif final_status == "pending":
+            app.logger.warning(f"Job {future_id} timed out after {timeout}s")
+            abort(500, f"Add LoRA timed out after {timeout}s")
+        result = futures_store[future_id].get("result")
+        if result is None:
+            app.logger.error(f"Job {future_id} completed but result is None. Status: {final_status}, Store: {futures_store[future_id]}")
+    return jsonify(result if isinstance(result, dict) else {"result": str(result)})
+
+@app.route("/api/v1/remove_lora_async", methods=["POST"])
+@app.route("/remove_lora", methods=["POST"])  # Legacy support
+def remove_lora_async():
+    """Remove LoRA adapter - async (returns future immediately)."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("remove_lora", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/load_weights", methods=["POST"])
-def load_weights():
+@app.route("/api/v1/remove_lora", methods=["POST"])
+def remove_lora():
+    """Remove LoRA adapter - sync (waits for result)."""
     future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("remove_lora", future_id, request.json)
+
+    # Wait for completion
+    import time
+    timeout = 30
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.5)
+        elapsed += 0.5
+
+    with futures_store_lock:
+        if futures_store[future_id]["status"] == "error":
+            error_msg = futures_store[future_id].get("result", "Unknown error")
+            abort(500, f"Remove LoRA failed: {error_msg}")
+        result = futures_store[future_id].get("result")
+    return jsonify(result if isinstance(result, dict) else {"result": str(result)})
+
+@app.route("/api/v1/load_weights_async", methods=["POST"])
+@app.route("/load_weights", methods=["POST"])  # Legacy support
+def load_weights_async():
+    """Load weights - async (returns future immediately)."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("load_weights", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/save_weights", methods=["POST"])
-def save_weights():
+@app.route("/api/v1/save_weights_async", methods=["POST"])
+@app.route("/save_weights", methods=["POST"])  # Legacy support
+def save_weights_async():
+    """Save weights - async (returns future immediately)."""
     future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("save_weights", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
 
-@app.route("/save_weights_for_sampler", methods=["POST"])
-def save_weights_for_sampler():
+@app.route("/api/v1/save_weights_for_sampler_async", methods=["POST"])
+@app.route("/save_weights_for_sampler", methods=["POST"])  # Legacy support
+def save_weights_for_sampler_async():
+    """Save weights for sampler - async (returns future immediately)."""
     future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
     enqueue_job("save_weights_for_sampler", future_id, request.json)
     model_id = request.json.get("model_id", "unknown")
     return jsonify({"request_id": future_id, "model_id": model_id})
@@ -254,6 +476,40 @@ def get_info():
         }
     }
     return jsonify(info)
+
+@app.route("/register_custom_loss", methods=["POST"])
+def register_custom_loss():
+    """Register a custom loss function sent from the client."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": request.json, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("register_custom_loss", future_id, request.json)
+    loss_name = request.json.get("loss_name", "unknown")
+    return jsonify({"request_id": future_id, "loss_name": loss_name})
+
+@app.route("/list_loss_functions", methods=["GET"])
+def list_loss_functions():
+    """List all available loss functions (built-in + custom)."""
+    future_id = generate_future_id()
+    with futures_store_lock:
+        futures_store[future_id] = {"request": {}, "status": "pending", "created_at": datetime.now(timezone.utc)}
+    enqueue_job("list_loss_functions", future_id, {})
+
+    # Wait for result (synchronous)
+    import time
+    timeout = 5
+    elapsed = 0
+    while True:
+        with futures_store_lock:
+            status = futures_store[future_id]["status"]
+        if status != "pending" or elapsed >= timeout:
+            break
+        time.sleep(0.1)
+        elapsed += 0.1
+
+    with futures_store_lock:
+        result = futures_store[future_id].get("result", {"available_loss_functions": []})
+    return jsonify(result)
 
 @app.route("/test_fwdbwd", methods=["GET"])
 def test_fwdbwd():
