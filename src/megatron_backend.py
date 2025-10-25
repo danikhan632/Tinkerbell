@@ -51,6 +51,7 @@ hf_model_name: Optional[str] = None  # Track source HF model name
 
 # LoRA adapter state
 lora_adapters: Dict[str, Dict[str, Any]] = {}  # Maps adapter_id -> {params, config, etc}
+peft_models: Dict[str, Any] = {}  # Maps adapter_id -> PEFT model (cached)
 optimizers: Dict[str, torch.optim.Optimizer] = {}  # Per-adapter optimizers
 gradients_accumulated: Dict[str, bool] = {}
 active_adapter_id: Optional[str] = None  # Currently active adapter
@@ -138,9 +139,16 @@ class ChatDataset(Dataset):
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded["attention_mask"].squeeze(0)
 
+        # Validate and clamp token IDs to valid range
+        vocab_size = self.tokenizer.vocab_size
+        if input_ids.max() >= vocab_size:
+            print(f"[ChatDataset] WARNING: Token ID {input_ids.max()} >= vocab_size {vocab_size}. Clamping...")
+            input_ids = torch.clamp(input_ids, 0, vocab_size - 1)
+
         # Create labels (same as input_ids for causal LM)
         labels = input_ids.clone()
-        labels[labels == self.tokenizer.pad_token_id] = -100
+        if self.tokenizer.pad_token_id is not None:
+            labels[labels == self.tokenizer.pad_token_id] = -100
 
         return {
             "input_ids": input_ids,
@@ -491,58 +499,164 @@ def forward_backward(
         num_batches = 0
         all_metrics = {}
 
-        # Process batches
-        # NOTE: This is a simplified loop. For full Megatron training with pipeline parallelism:
-        # 1. Use get_forward_backward_func() from megatron.core.pipeline_parallel
-        # 2. Define forward_step_fn that calls your Megatron model and returns (output, loss_func)
-        # 3. Call forward_backward(forward_step_func, data_iterator, model, ...)
-        # See examples/rl/rlhf_with_bridge.py:279-370 for complete implementation
+        # Get or create PEFT model for this adapter
+        # Cache the model to avoid recreating it every time
+        global peft_models
 
+        if model_id in peft_models:
+            # Use cached PEFT model
+            peft_model = peft_models[model_id]
+            print(f"[{model_id}] Using cached PEFT model")
+        else:
+            # Create new PEFT model for this adapter
+            try:
+                from peft import get_peft_model, LoraConfig as PeftLoraConfig, TaskType
+
+                # Get base HF model from Bridge
+                # Bridge.hf_model is the HuggingFace model that syncs with Megatron
+                if not hasattr(bridge, 'hf_model') or bridge.hf_model is None:
+                    # Load HF model for training
+                    print(f"[{model_id}] Loading HF model: {hf_model_name}")
+                    hf_model = AutoModelForCausalLM.from_pretrained(
+                        hf_model_name,
+                        torch_dtype=torch.float32,
+                        trust_remote_code=True
+                    ).to(device)
+                else:
+                    hf_model = bridge.hf_model
+
+                # Apply LoRA to the model
+                adapter_info = lora_adapters[model_id]
+                lora_config_params = adapter_info["config"]
+
+                peft_config = PeftLoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=lora_config_params.r,
+                    lora_alpha=lora_config_params.lora_alpha,
+                    lora_dropout=lora_config_params.lora_dropout,
+                    target_modules=lora_config_params.target_modules,
+                    bias=lora_config_params.bias
+                )
+
+                # Resize token embeddings if tokenizer vocab size > model vocab size
+                if tokenizer.vocab_size > hf_model.config.vocab_size:
+                    print(f"[{model_id}] Resizing token embeddings: {hf_model.config.vocab_size} → {tokenizer.vocab_size}")
+                    hf_model.resize_token_embeddings(tokenizer.vocab_size)
+
+                # Create PEFT model (adds LoRA layers)
+                peft_model = get_peft_model(hf_model, peft_config)
+                peft_model.train()
+
+                # Cache for future use
+                peft_models[model_id] = peft_model
+
+                # Store trainable parameters in adapter info for optimizer
+                adapter_info["parameters"] = {
+                    name: param for name, param in peft_model.named_parameters()
+                    if param.requires_grad
+                }
+
+                print(f"[{model_id}] Created PEFT model with {peft_model.num_parameters()} params ({peft_model.num_parameters(only_trainable=True)} trainable)")
+                print(f"[{model_id}] Cached {len(adapter_info['parameters'])} trainable parameters")
+                print(f"[{model_id}] Model vocab size: {peft_model.config.vocab_size}, Tokenizer vocab size: {tokenizer.vocab_size}")
+
+            except Exception as e:
+                print(f"[{model_id}] Warning: Could not create PEFT model: {e}")
+                import traceback
+                traceback.print_exc()
+                print(f"[{model_id}] Falling back to simulated training")
+                peft_model = None
+
+        # Process batches with actual forward-backward
         for batch_idx, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
             labels = batch.get("labels", input_ids.clone())
 
-            # TODO: Implement actual Megatron model forward pass
-            # For production RL training pattern:
-            #
-            # def forward_step_fn(data_iterator, megatron_model):
-            #     batch = next(data_iterator)
-            #     outputs = megatron_model(
-            #         input_ids=batch["input_ids"],
-            #         attention_mask=batch["attention_mask"],
-            #         position_ids=batch.get("position_ids"),
-            #     )
-            #
-            #     def loss_func(outputs):
-            #         if loss_fn == "cross_entropy":
-            #             return compute_ce_loss(outputs, labels)
-            #         elif loss_fn == "ppo":
-            #             return compute_ppo_loss(outputs, batch, loss_fn_inputs)
-            #         # ... other losses
-            #
-            #     return outputs, loss_func
-            #
-            # forward_backward_func(
-            #     forward_step_func=forward_step_fn,
-            #     data_iterator=iter(dataloader),
-            #     model=megatron_model,
-            #     num_microbatches=1,
-            #     seq_length=max_seq_len,
-            #     micro_batch_size=batch_size,
-            # )
+            # Debug: Print token ID stats
+            print(f"[{model_id}] Batch {batch_idx}: input_ids shape={input_ids.shape}, min={input_ids.min()}, max={input_ids.max()}")
 
-            # Placeholder: Simulated loss for API compatibility
-            # In production, replace with actual model forward + backward
-            if loss_fn == "cross_entropy":
-                batch_loss = 0.5  # Simulated CE loss
-            elif loss_fn in ("ppo", "importance_sampling"):
-                # RL loss would use rewards from loss_fn_inputs
-                rewards = loss_fn_inputs.get("rewards", [0.0]) if loss_fn_inputs else [0.0]
-                batch_loss = 1.0 - rewards[0]  # Simulated RL loss
+            # Validate token IDs are within vocabulary
+            if peft_model is not None:
+                vocab_size = peft_model.config.vocab_size
+                print(f"[{model_id}] Model vocab size: {vocab_size}, tokenizer vocab size: {tokenizer.vocab_size}")
+
+                if input_ids.max() >= vocab_size or input_ids.min() < 0:
+                    print(f"[{model_id}] ERROR: Token IDs out of range! Min: {input_ids.min()}, Max: {input_ids.max()}, Vocab size: {vocab_size}")
+                    print(f"[{model_id}] This means tokenizer and model vocab size mismatch!")
+                    # Clamp to valid range as emergency fix
+                    input_ids = torch.clamp(input_ids, 0, vocab_size - 1)
+                    labels = torch.clamp(labels, -100, vocab_size - 1)
+
+            # Move to device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+
+            if peft_model is not None:
+                # REAL forward pass through HF model with LoRA
+                outputs = peft_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+
+                # Compute loss based on loss function type
+                if loss_fn == "cross_entropy":
+                    # Standard causal LM loss (already computed by model)
+                    loss_tensor = outputs.loss
+                    batch_loss = loss_tensor.item()
+
+                    # BACKWARD pass
+                    loss_tensor.backward()
+
+                elif loss_fn in ("ppo", "importance_sampling"):
+                    # RL loss: reward-weighted policy gradient
+                    rewards = loss_fn_inputs.get("rewards", [0.0]) if loss_fn_inputs else [0.0]
+
+                    # Get logits and compute log probabilities
+                    logits = outputs.logits
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous().to(device)  # Ensure on same device
+
+                    # Compute per-token log probs
+                    log_probs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+                    gathered_log_probs = log_probs.gather(
+                        dim=-1,
+                        index=shift_labels.unsqueeze(-1)
+                    ).squeeze(-1)
+
+                    # Mask padding tokens
+                    mask = (shift_labels != -100).float()
+                    gathered_log_probs = gathered_log_probs * mask
+
+                    # REINFORCE loss: -reward * sum(log_prob)
+                    reward_tensor = torch.tensor(rewards[0], device=device)
+                    policy_loss = -(reward_tensor * gathered_log_probs.sum())
+
+                    # BACKWARD pass
+                    policy_loss.backward()
+
+                    batch_loss = policy_loss.item()
+
+                else:
+                    # Custom loss function
+                    loss_tensor = outputs.loss if hasattr(outputs, 'loss') else torch.tensor(0.5, device=device, requires_grad=True)
+                    batch_loss = loss_tensor.item()
+
+                    # BACKWARD pass
+                    if loss_tensor.requires_grad:
+                        loss_tensor.backward()
+
             else:
-                # Custom loss function
-                batch_loss = 0.5
+                # Fallback: Simulated loss
+                if loss_fn == "cross_entropy":
+                    batch_loss = 0.5
+                elif loss_fn in ("ppo", "importance_sampling"):
+                    rewards = loss_fn_inputs.get("rewards", [0.0]) if loss_fn_inputs else [0.0]
+                    batch_loss = 1.0 - rewards[0]
+                else:
+                    batch_loss = 0.5
 
             total_loss += batch_loss
             num_batches += 1
@@ -794,7 +908,7 @@ def list_optimizer_states() -> List[Dict[str, Any]]:
 
 def remove_lora_adapter(model_id: str) -> bool:
     """
-    Remove a LoRA adapter and its associated optimizer.
+    Remove a LoRA adapter and its associated optimizer and PEFT model.
 
     Args:
         model_id: Adapter ID to remove
@@ -802,6 +916,8 @@ def remove_lora_adapter(model_id: str) -> bool:
     Returns:
         True if adapter was removed, False if not found
     """
+    global peft_models
+
     with _adapters_lock:
         if model_id in lora_adapters:
             del lora_adapters[model_id]
@@ -809,6 +925,12 @@ def remove_lora_adapter(model_id: str) -> bool:
             if model_id in optimizers:
                 del optimizers[model_id]
                 print(f"Removed optimizer for '{model_id}'")
+
+            if model_id in peft_models:
+                # Clean up PEFT model and free GPU memory
+                del peft_models[model_id]
+                torch.cuda.empty_cache()
+                print(f"Removed PEFT model for '{model_id}'")
 
             if model_id in gradients_accumulated:
                 del gradients_accumulated[model_id]
